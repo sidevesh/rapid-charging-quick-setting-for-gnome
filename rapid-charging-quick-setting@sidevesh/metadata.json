@@ -1,0 +1,12 @@
+{
+  "name": "Rapid Charging Quick Setting",
+  "description": "Quick setting toggle for Rapid Charging (enable / disable charge_types: Fast)",
+  "uuid": "rapid-charging-quick-setting@sidevesh",
+  "shell-version": [
+    "48",
+    "49",
+    "50"
+  ],
+  "url": "https://github.com/sidevesh/rapid-charging-quick-setting-for-gnome",
+  "version": 1
+}

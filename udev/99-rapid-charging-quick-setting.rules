@@ -1,0 +1,12 @@
+# Grants the "power" group write access to a battery's charge_types
+# sysfs attribute, so the Rapid Charging Quick Setting extension can
+# toggle it without running as root.
+#
+# Install with:
+#   sudo cp udev/99-rapid-charging-quick-setting.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#
+# Make sure your user is in the "power" group (`sudo usermod -aG power $USER`,
+# then log out and back in) before this has any effect.
+ACTION=="add|change", SUBSYSTEM=="power_supply", ATTR{charge_types}=="?*", RUN+="/usr/bin/chgrp power /sys%p/charge_types", RUN+="/usr/bin/chmod 0664 /sys%p/charge_types"
