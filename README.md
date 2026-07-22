@@ -17,4 +17,4 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-Log out and back in for the group membership change to take effect, then install the extension by copying `rapid-charging-quick-setting@sidevesh` into `~/.local/share/gnome-shell/extensions/` and enabling it with `gnome-extensions enable rapid-charging-quick-setting@sidevesh`.
+Log out and back in for the group membership change to take effect.
