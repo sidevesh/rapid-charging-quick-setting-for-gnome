@@ -5,22 +5,23 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 
+Gio._promisify(Gio.File.prototype, 'enumerate_children_async');
+Gio._promisify(Gio.File.prototype, 'load_contents_async');
+Gio._promisify(Gio.File.prototype, 'replace_contents_bytes_async', 'replace_contents_finish');
+
 const POWER_SUPPLY_DIR = '/sys/class/power_supply';
 const CHARGE_TYPES_ATTR = 'charge_types';
 const CHARGE_CONTROL_START_THRESHOLD_ATTR = 'charge_control_start_threshold';
 const CHARGE_CONTROL_END_THRESHOLD_ATTR = 'charge_control_end_threshold';
 const FAST_CHARGE_TYPE = 'Fast';
 const STANDARD_CHARGE_TYPE = 'Standard';
+// The kernel emits no change notification for charge_types, so it has to be polled.
 const POLL_INTERVAL_SECONDS = 5;
+const UP_DEVICE_KIND_BATTERY = 2;
 
-// Used only to keep UPower's own ChargeThresholdEnabled property truthful when
-// we write charge_types directly (see _setupUPowerSync). UPower has no concept
-// of "Fast" -- EnableChargeThreshold(bool) only distinguishes Long_Life
-// (enabled) from "whatever charge type UPower itself picks" (disabled), so we
-// can't delegate the actual Fast/Standard write to it. We only ever call it
-// with `false`, to correct its cached state after it goes stale relative to
-// a charge_types change we made ourselves; the real write below is what
-// actually sets Fast or Standard.
+// UPower has no notion of "Fast", so charge_types is written directly. UPower is
+// only used to clear its cached ChargeThresholdEnabled, which goes stale when
+// charge_types changes underneath it.
 const UPowerIface = `
 <node>
   <interface name="org.freedesktop.UPower">
@@ -48,6 +49,23 @@ const UPowerDeviceIface = `
 const UPowerProxy = Gio.DBusProxy.makeProxyWrapper(UPowerIface);
 const UPowerDeviceProxy = Gio.DBusProxy.makeProxyWrapper(UPowerDeviceIface);
 
+function logError(message, e) {
+    if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+        console.error(message, e);
+}
+
+function createProxy(ProxyClass, objectPath, cancellable) {
+    return new Promise((resolve, reject) => {
+        new ProxyClass(
+            Gio.DBus.system,
+            'org.freedesktop.UPower',
+            objectPath,
+            (proxy, error) => error ? reject(error) : resolve(proxy),
+            cancellable
+        );
+    });
+}
+
 const RapidChargingToggle = GObject.registerClass(
 class RapidChargingToggle extends QuickSettings.QuickToggle {
     _init() {
@@ -55,135 +73,93 @@ class RapidChargingToggle extends QuickSettings.QuickToggle {
             title: 'Rapid Charging',
             iconName: 'battery-full-charging-symbolic',
             toggleMode: true,
+            visible: false,
         });
 
         this._chargeTypesPath = null;
         this._deviceNativePath = null;
-        this._upowerSyncNeeded = false;
         this._upowerDeviceProxy = null;
         this._cancellable = new Gio.Cancellable();
-        this._pollSourceId = null;
 
-        this.connect('clicked', () => this._toggleRapidCharge());
-
-        this._findChargeTypesFile();
-        this._pollSourceId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, POLL_INTERVAL_SECONDS, () => {
-            this._sync();
-            return GLib.SOURCE_CONTINUE;
+        this.connect('clicked', () => {
+            this._toggleRapidCharge().catch(e => logError('Failed to set charge type:', e));
         });
 
-        if (this._upowerSyncNeeded)
-            this._setupUPowerSync();
+        this._setup().catch(e => logError('Failed to set up Rapid Charging:', e));
+
+        this._pollSourceId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, POLL_INTERVAL_SECONDS, () => {
+            this._sync().catch(e => logError('Failed to read charge type:', e));
+            return GLib.SOURCE_CONTINUE;
+        });
     }
 
-    // Looks for a power_supply device exposing a charge_types attribute
-    // that lists "Fast" (Rapid Charge) as one of its options.
-    _findChargeTypesFile() {
-        this._chargeTypesPath = null;
+    async _setup() {
+        const upowerSyncNeeded = await this._findChargeTypesFile();
+        await this._sync();
 
-        try {
-            const dir = Gio.File.new_for_path(POWER_SUPPLY_DIR);
-            const enumerator = dir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+        if (upowerSyncNeeded)
+            await this._setupUPowerSync();
+    }
 
-            let info;
-            while ((info = enumerator.next_file(null))) {
-                const deviceName = info.get_name();
-                const devicePath = GLib.build_filenamev([POWER_SUPPLY_DIR, deviceName]);
-                const path = GLib.build_filenamev([devicePath, CHARGE_TYPES_ATTR]);
-                const contents = this._readFile(path);
-                if (contents !== null && contents.includes(FAST_CHARGE_TYPE)) {
-                    this._chargeTypesPath = path;
-                    this._deviceNativePath = deviceName;
-                    // Only worth reconciling with UPower on devices where the
-                    // charge threshold is controlled through this same
-                    // charge_types attribute rather than real
-                    // charge_control_start/end_threshold attributes -- see
-                    // up_device_supply_battery_is_charge_threshold_by_charge_type()
-                    // in upower's src/linux/up-device-supply-battery.c. On real
-                    // threshold hardware, UPower's EnableChargeThreshold would
-                    // touch charge_control_*_threshold instead, which we must
-                    // never do from here.
-                    this._upowerSyncNeeded =
-                        !GLib.file_test(GLib.build_filenamev([devicePath, CHARGE_CONTROL_START_THRESHOLD_ATTR]), GLib.FileTest.EXISTS) &&
-                        !GLib.file_test(GLib.build_filenamev([devicePath, CHARGE_CONTROL_END_THRESHOLD_ATTR]), GLib.FileTest.EXISTS);
-                    break;
-                }
-            }
-            enumerator.close(null);
-        } catch (e) {
-            console.log('Failed to look for a rapid-charge-capable battery:', e);
+    // Returns whether UPower should be kept in sync, which is only the case when
+    // charge_types also acts as the charge threshold (no charge_control_*_threshold
+    // attributes). Otherwise UPower's EnableChargeThreshold writes those attributes,
+    // which must never happen from here.
+    async _findChargeTypesFile() {
+        const dir = Gio.File.new_for_path(POWER_SUPPLY_DIR);
+        const enumerator = await dir.enumerate_children_async(
+            'standard::name', Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, this._cancellable);
+
+        for await (const info of enumerator) {
+            const deviceName = info.get_name();
+            const devicePath = GLib.build_filenamev([POWER_SUPPLY_DIR, deviceName]);
+            const contents = await this._readFile(GLib.build_filenamev([devicePath, CHARGE_TYPES_ATTR]));
+            if (!contents?.includes(FAST_CHARGE_TYPE))
+                continue;
+
+            this._chargeTypesPath = GLib.build_filenamev([devicePath, CHARGE_TYPES_ATTR]);
+            this._deviceNativePath = deviceName;
+
+            const startThreshold = await this._readFile(GLib.build_filenamev([devicePath, CHARGE_CONTROL_START_THRESHOLD_ATTR]));
+            const endThreshold = await this._readFile(GLib.build_filenamev([devicePath, CHARGE_CONTROL_END_THRESHOLD_ATTR]));
+            return startThreshold === null && endThreshold === null;
         }
 
-        this._sync();
+        return false;
     }
 
-    // Finds the UPower device object matching our battery, so we can correct
-    // its cached ChargeThresholdEnabled property when we change charge_types
-    // out from under it (UPower only updates that property from its own
-    // writes or at battery-plug time, never by re-reading live charge_types --
-    // see up_device_battery_update_info() in upower's src/up-device-battery.c).
-    // Failure here is non-fatal: it just means we skip the UPower sync step
-    // and behave exactly as before.
     async _setupUPowerSync() {
-        try {
-            const upowerProxy = await new Promise((resolve, reject) => {
-                new UPowerProxy(
-                    Gio.DBus.system,
-                    'org.freedesktop.UPower',
-                    '/org/freedesktop/UPower',
-                    (proxy, error) => error ? reject(error) : resolve(proxy),
-                    this._cancellable
-                );
-            });
+        const upowerProxy = await createProxy(UPowerProxy, '/org/freedesktop/UPower', this._cancellable);
+        const [devicePaths] = await upowerProxy.EnumerateDevicesAsync();
 
-            const [devicePaths] = await upowerProxy.EnumerateDevicesAsync();
-            for (const devicePath of devicePaths) {
-                const deviceProxy = await new Promise((resolve, reject) => {
-                    new UPowerDeviceProxy(
-                        Gio.DBus.system,
-                        'org.freedesktop.UPower',
-                        devicePath,
-                        (proxy, error) => error ? reject(error) : resolve(proxy),
-                        this._cancellable
-                    );
-                });
-
-                // UP_DEVICE_KIND_BATTERY is 2
-                if (deviceProxy.Type === 2 && deviceProxy.PowerSupply &&
-                    deviceProxy.ChargeThresholdSupported && deviceProxy.NativePath === this._deviceNativePath) {
-                    this._upowerDeviceProxy = deviceProxy;
-                    break;
-                }
+        for (const devicePath of devicePaths) {
+            const deviceProxy = await createProxy(UPowerDeviceProxy, devicePath, this._cancellable);
+            if (deviceProxy.Type === UP_DEVICE_KIND_BATTERY && deviceProxy.PowerSupply &&
+                deviceProxy.ChargeThresholdSupported && deviceProxy.NativePath === this._deviceNativePath) {
+                this._upowerDeviceProxy = deviceProxy;
+                return;
             }
-        } catch (e) {
-            if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
-                console.log('Failed to set up UPower sync (Preserve Battery toggle may show stale state):', e);
         }
     }
 
-    _readFile(path) {
+    // Resolves to null when the file is missing or unreadable; rejects only when cancelled.
+    async _readFile(path) {
         try {
-            const [ok, contents] = Gio.File.new_for_path(path).load_contents(null);
-            return ok ? new TextDecoder().decode(contents).trim() : null;
+            const [contents] = await Gio.File.new_for_path(path).load_contents_async(this._cancellable);
+            return new TextDecoder().decode(contents).trim();
         } catch (e) {
+            if (e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                throw e;
             return null;
         }
     }
 
-    _sync() {
-        if (!this._chargeTypesPath) {
-            this.visible = false;
-            return;
-        }
+    async _sync() {
+        const contents = this._chargeTypesPath ? await this._readFile(this._chargeTypesPath) : null;
 
-        const contents = this._readFile(this._chargeTypesPath);
-        if (contents === null) {
-            this.visible = false;
-            return;
-        }
-
-        this.visible = true;
-        this.checked = contents.includes(`[${FAST_CHARGE_TYPE}]`);
+        this.visible = contents !== null;
+        if (contents !== null)
+            this.checked = contents.includes(`[${FAST_CHARGE_TYPE}]`);
     }
 
     async _toggleRapidCharge() {
@@ -192,36 +168,31 @@ class RapidChargingToggle extends QuickSettings.QuickToggle {
 
         const desiredType = this.checked ? FAST_CHARGE_TYPE : STANDARD_CHARGE_TYPE;
 
-        // Neither Fast nor Standard is Long_Life, so either way we're about to
-        // move this device away from what UPower would call "charge threshold
-        // enabled". If UPower still thinks it's enabled, tell it otherwise
-        // first so its cached property/state file don't go stale -- see the
-        // comment on _setupUPowerSync above for why this can't just be an
-        // EnableChargeThreshold(true) call for Fast instead of a direct write.
+        // Neither Fast nor Standard is Long_Life, so UPower must not keep reporting the threshold as enabled.
         if (this._upowerDeviceProxy?.ChargeThresholdEnabled) {
             try {
                 await this._upowerDeviceProxy.EnableChargeThresholdAsync(false);
             } catch (e) {
-                console.log('Failed to sync UPower charge threshold state:', e);
+                console.error('Failed to sync UPower charge threshold state:', e);
             }
         }
 
         try {
-            const bytes = new TextEncoder().encode(desiredType);
-            Gio.File.new_for_path(this._chargeTypesPath)
-                .replace_contents(bytes, null, false, Gio.FileCreateFlags.NONE, null);
+            const bytes = new GLib.Bytes(new TextEncoder().encode(desiredType));
+            await Gio.File.new_for_path(this._chargeTypesPath)
+                .replace_contents_bytes_async(bytes, null, false, Gio.FileCreateFlags.NONE, this._cancellable);
         } catch (e) {
-            console.log('Failed to set charge type (see README for the required udev rule):', e);
+            if (e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                throw e;
+            console.error('Failed to set charge type (see README for the required udev rule):', e);
         }
 
-        this._sync();
+        await this._sync();
     }
 
     destroy() {
-        if (this._pollSourceId) {
-            GLib.source_remove(this._pollSourceId);
-            this._pollSourceId = null;
-        }
+        GLib.Source.remove(this._pollSourceId);
+        this._pollSourceId = null;
 
         this._cancellable.cancel();
 
@@ -240,7 +211,6 @@ class RapidChargingIndicator extends QuickSettings.SystemIndicator {
 
 export default class RapidChargingExtension extends Extension {
     enable() {
-        if (this._indicator) return;
         this._indicator = new RapidChargingIndicator();
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
     }
