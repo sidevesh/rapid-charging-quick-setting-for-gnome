@@ -46,9 +46,6 @@ const UPowerDeviceIface = `
   </interface>
 </node>`;
 
-const UPowerProxy = Gio.DBusProxy.makeProxyWrapper(UPowerIface);
-const UPowerDeviceProxy = Gio.DBusProxy.makeProxyWrapper(UPowerDeviceIface);
-
 function logError(message, e) {
     if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
         console.error(message, e);
@@ -80,6 +77,9 @@ class RapidChargingToggle extends QuickSettings.QuickToggle {
         this._deviceNativePath = null;
         this._upowerDeviceProxy = null;
         this._cancellable = new Gio.Cancellable();
+
+        this._UPowerProxy = Gio.DBusProxy.makeProxyWrapper(UPowerIface);
+        this._UPowerDeviceProxy = Gio.DBusProxy.makeProxyWrapper(UPowerDeviceIface);
 
         this.connect('clicked', () => {
             this._toggleRapidCharge().catch(e => logError('Failed to set charge type:', e));
@@ -129,11 +129,11 @@ class RapidChargingToggle extends QuickSettings.QuickToggle {
     }
 
     async _setupUPowerSync() {
-        const upowerProxy = await createProxy(UPowerProxy, '/org/freedesktop/UPower', this._cancellable);
+        const upowerProxy = await createProxy(this._UPowerProxy, '/org/freedesktop/UPower', this._cancellable);
         const [devicePaths] = await upowerProxy.EnumerateDevicesAsync();
 
         for (const devicePath of devicePaths) {
-            const deviceProxy = await createProxy(UPowerDeviceProxy, devicePath, this._cancellable);
+            const deviceProxy = await createProxy(this._UPowerDeviceProxy, devicePath, this._cancellable);
             if (deviceProxy.Type === UP_DEVICE_KIND_BATTERY && deviceProxy.PowerSupply &&
                 deviceProxy.ChargeThresholdSupported && deviceProxy.NativePath === this._deviceNativePath) {
                 this._upowerDeviceProxy = deviceProxy;
