@@ -195,6 +195,7 @@ class RapidChargingToggle extends QuickSettings.QuickToggle {
         this._pollSourceId = null;
 
         this._cancellable.cancel();
+        this._upowerDeviceProxy = null;
 
         super.destroy();
     }
